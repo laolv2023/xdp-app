@@ -762,6 +762,7 @@ int xskif_setup(struct xskif *xif, int core_id, int numa_node,
         numa_free_nodemask(saved_nodemask);
         saved_nodemask = NULL;
     }
+    saved_policy_mode = -1;                                  /* R4-1a: prevent free_pools from overriding restored policy */
     policy_restored = true;                                  /* R4-1: block free_pools re-restore */
     if (rlimit_changed) {
         if (setrlimit(RLIMIT_MEMLOCK, &orig_rlimit) != 0) {
@@ -1199,7 +1200,6 @@ static void xsk_tx_completion_batch(struct xskif *xif) {
             (base / XSK_UMEM_FRAME_SIZE) >= xif->pool->capacity) {
             xif->stats.ghost_completions++;
             xif->pool->need_reset = true;                    /* R6-1 */
-            continue;
         }
         int ret = free_pool_push(xif->pool, base, &xif->stats);
         if (ret != FREEPOOL_OK && ret != FREEPOOL_EEXIST) {
@@ -1777,7 +1777,7 @@ int main(int argc, char **argv) {
             }
         }
 
-      eck_timeouts();
+        sys_check_timeouts();
         usleep(1000);
     }
 
