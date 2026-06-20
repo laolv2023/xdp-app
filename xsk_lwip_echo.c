@@ -618,10 +618,6 @@ static int xskif_setup(struct xskif *xif, int core_id, int numa_node,
     uint32_t frames_per_core = base_frames + ((uint32_t)core_id < remainder ? 1 : 0);
 
     uint64_t aligned_frames = align_up((uint64_t)frames_per_core, UMEM_2MB_FRAME_COUNT);
-    if (aligned_frames == (uint64_t)-1) {
-        fprintf(stderr, "frames_per_core alignment failed\n");
-        return -EINVAL;
-    }
     if (aligned_frames > UINT32_MAX) {
         fprintf(stderr, "frames_per_core overflow after alignment\n");
         return -EINVAL;
@@ -888,6 +884,7 @@ free_umem:
 free_mem:
     if (xif->umem_area != MAP_FAILED) {
         munmap(xif->umem_area, xif->umem_size);
+        xif->umem_area = MAP_FAILED;                         /* R11: prevent double-munmap */
     }
 free_pools:
     /* R2-3/R4-1: restore policy / free saved_nodemask; skip if already restored mid-fn */
@@ -933,12 +930,14 @@ static err_t xskif_netif_init(struct netif *netif) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct ifreq ifr;
     int mtu = 1500;
-    int ioctl_ret;
+    int ioctl_ret, ioctl_retries;                            /* R11: bounded EINTR retry */
 
     if (sock >= 0) {
         memset(&ifr, 0, sizeof(ifr));
         strncpy(ifr.ifr_name, xif->ifname, IFNAMSIZ-1);
-        while ((ioctl_ret = ioctl(sock, SIOCGIFMTU, &ifr)) < 0 && errno == EINTR);
+        ioctl_retries = 0;
+        while ((ioctl_ret = ioctl(sock, SIOCGIFMTU, &ifr)) < 0 && errno == EINTR
+               && ++ioctl_retries < 100);                   /* R11: bounded EINTR retry */
         if (ioctl_ret == 0) {
             mtu = ifr.ifr_mtu;
             if (mtu > XSK_UMEM_FRAME_SIZE) {
@@ -950,7 +949,9 @@ static err_t xskif_netif_init(struct netif *netif) {
 
         memset(&ifr, 0, sizeof(ifr));
         strncpy(ifr.ifr_name, xif->ifname, IFNAMSIZ-1);
-        while ((ioctl_ret = ioctl(sock, SIOCGIFHWADDR, &ifr)) < 0 && errno == EINTR);
+        ioctl_retries = 0;
+        while ((ioctl_ret = ioctl(sock, SIOCGIFHWADDR, &ifr)) < 0 && errno == EINTR
+               && ++ioctl_retries < 100);                   /* R11: bounded EINTR retry */
         if (ioctl_ret == 0) {
             memcpy(netif->hwaddr, ifr.ifr_hwaddr.sa_data, 6);
         } else {
@@ -1019,12 +1020,14 @@ static err_t xskif_output(struct netif *netif, struct pbuf *p) {
         xskif_safe_free_addr(xif, addr);
         if (!xif->resetting && xsk_ring_prod__needs_wakeup(&xif->tx)) {
             ssize_t sr;
+            int sr_retries = 0;                              /* R11: bounded EINTR retry */
             do {
                 sr = sendto(xsk_socket__fd(xif->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-            } while (sr < 0 && errno == EINTR);
+            } while (sr < 0 && errno == EINTR && ++sr_retries < 100);
             if (sr < 0 && (errno == EBADF || errno == EINVAL)) {
                 xif->pool->need_reset = true;
             }
+            if (sr < 0) xif->stats.tx_sendto_fails++;       /* R11: track reserve-fail sendto errors */
         }
         return ERR_MEM;
     }
@@ -1040,9 +1043,10 @@ static err_t xskif_output(struct netif *netif, struct pbuf *p) {
 
     if (xsk_ring_prod__needs_wakeup(&xif->tx)) {
         ssize_t ret;
+        int retries = 0;                                     /* R11: bounded EINTR retry */
         do {
             ret = sendto(xsk_socket__fd(xif->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-        } while (ret < 0 && errno == EINTR);
+        } while (ret < 0 && errno == EINTR && ++retries < 100);
         if (ret < 0) {
             if (errno == EBADF || errno == EINVAL) {
                 xif->pool->need_reset = true;                /* R6-1: main loop will trigger reset */
@@ -1208,6 +1212,7 @@ static void xsk_tx_completion_batch(struct xskif *xif) {
             (base / XSK_UMEM_FRAME_SIZE) >= xif->pool->capacity) {
             xif->stats.ghost_completions++;
             xif->pool->need_reset = true;                    /* R6-1 */
+            continue;                                        /* R11-L2: skip push for invalid ghost completions */
         }
         int ret = free_pool_push(xif->pool, base, &xif->stats);
         if (ret != FREEPOOL_OK && ret != FREEPOOL_EEXIST) {
@@ -1247,7 +1252,7 @@ static uint32_t xsk_replenish_fill_ring(struct xskif *xif, uint32_t cnt) {
     }
 
     u32 idx;
-    if (xsk_ring_prod__reserve(&xif->fill, to_fill, &idx) != to_fill) {
+    if (xsk_ring_prod__reserve(&xif->fill, to_fill, &idx) == 0) {  /* R11-L1: use ==0 for consistency */
         for (u32 i = 0; i < to_fill; i++) {
             int ret = free_pool_push(xif->pool, addrs[i], &xif->stats);
             if (ret != FREEPOOL_OK && ret != FREEPOOL_EEXIST) {
@@ -1264,12 +1269,14 @@ static uint32_t xsk_replenish_fill_ring(struct xskif *xif, uint32_t cnt) {
     /* R2-2: wake kernel if it went to sleep waiting for fill ring entries */
     if (xsk_ring_prod__needs_wakeup(&xif->fill)) {
         ssize_t ret;
+        int retries = 0;                                     /* R11: bounded EINTR retry */
         do {
             ret = sendto(xsk_socket__fd(xif->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-        } while (ret < 0 && errno == EINTR);
+        } while (ret < 0 && errno == EINTR && ++retries < 100);
         if (ret < 0 && (errno == EBADF || errno == EINVAL)) {
             xif->pool->need_reset = true;
         }
+        if (ret < 0) xif->stats.tx_sendto_fails++;          /* R11-L3: track fill-ring sendto errors */
     }
     return to_fill;
 }
@@ -1498,7 +1505,7 @@ static err_t echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
     if (err != ERR_OK) {
         if (p) pbuf_free(p);
         echo_connection_cleanup(ctx);                    /* R2-1: don't NULL ctx->pcb before cleanup */
-        return ERR_ABRT;
+        return ERR_OK;                                   /* R11: PCB already aborted by cleanup */
     }
 
     if (ctx->queued_msg_count >= MAX_QUEUED_MSGS_PER_CONN) {
@@ -1509,7 +1516,7 @@ static err_t echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
         tcp_abort(pcb);
         ctx->pcb = NULL;
         echo_connection_cleanup(ctx);
-        return ERR_ABRT;
+        return ERR_OK;                                   /* R11: PCB already aborted */
     }
 
     struct queued_msg *msg = malloc(sizeof(*msg));
@@ -1521,7 +1528,7 @@ static err_t echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
         tcp_abort(pcb);
         ctx->pcb = NULL;
         echo_connection_cleanup(ctx);
-        return ERR_ABRT;
+        return ERR_OK;                                   /* R11: PCB already aborted */
     }
 
     msg->p = p;
@@ -1719,10 +1726,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     char *ifname = argv[1];
-    int   core_id      = (argc > 2) ? atoi(argv[2]) : 0;
-    int   numa_node    = (argc > 3) ? atoi(argv[3]) : 0;
-    int   num_cores    = (argc > 4) ? atoi(argv[4]) : 1;
-    int   total_frames = (argc > 5) ? atoi(argv[5]) : 16384;
+
+    /* R11-R5: use strtol for validation (atoi can't distinguish "abc" from 0) */
+    int   core_id = 0, numa_node = 0, num_cores = 1, total_frames = 16384;
+    for (int i = 2; i < argc && i <= 5; i++) {
+        char *end;
+        long val = strtol(argv[i], &end, 0);
+        if (*end != '\0' || val < 0 || val > INT_MAX) {
+            fprintf(stderr, "Invalid argument %d: '%s' (expected integer)\n", i, argv[i]);
+            return 1;
+        }
+        if      (i == 2) core_id      = (int)val;
+        else if (i == 3) numa_node    = (int)val;
+        else if (i == 4) num_cores    = (int)val;
+        else if (i == 5) total_frames = (int)val;
+    }
 
     if (num_cores <= 0) { num_cores = 1; }
     if (total_frames < num_cores) { total_frames = num_cores; }
@@ -1763,7 +1781,11 @@ int main(int argc, char **argv) {
         xskif_destroy(&xif);
         return 1;
     }
-    tcp_bind(xif.listen_pcb, IP_ADDR_ANY, 7);
+    if (tcp_bind(xif.listen_pcb, IP_ADDR_ANY, 7) != ERR_OK) {
+        fprintf(stderr, "tcp_bind port 7 failed (port in use? need root?)\n");
+        xskif_destroy(&xif);
+        return 1;
+    }
     struct tcp_pcb *listen_pcb = tcp_listen(xif.listen_pcb);
     if (!listen_pcb) {
         fprintf(stderr, "tcp_listen failed\n");
@@ -1778,15 +1800,26 @@ int main(int argc, char **argv) {
     /* R10-5: use sigaction for reliable signal semantics (signal() has
      * ambiguous System-V vs BSD behavior across platforms) */
     struct sigaction sa = { .sa_handler = signal_handler, .sa_flags = 0 };
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);                           /* MD-7: stats dump on SIGUSR1 */
+    if (sigemptyset(&sa.sa_mask) != 0) {
+        fprintf(stderr, "FATAL: sigemptyset failed: %s\n", strerror(errno));
+        xskif_destroy(&xif);
+        return 1;
+    }
+    if (sigaction(SIGINT,  &sa, NULL) != 0 ||
+        sigaction(SIGTERM, &sa, NULL) != 0) {
+        fprintf(stderr, "FATAL: sigaction(SIGINT/SIGTERM) failed: %s\n", strerror(errno));
+        xskif_destroy(&xif);
+        return 1;
+    }
+    {
+        struct sigaction sa_usr = { .sa_handler = signal_handler, .sa_flags = 0 };
+        sigemptyset(&sa_usr.sa_mask);
+        sigaction(SIGUSR1, &sa_usr, NULL);                   /* MD-7: non-fatal if fails */
+    }
     signal(SIGPIPE, SIG_IGN);    /* R10-5: prevent crash on broken pipe */
 
     while (g_running) {
-        if (g_print_stats) {                                 /* MD-7: signal-handler sets this flag */
-            g_print_stats = 0;
+        if (__atomic_exchange_n(&g_print_stats, 0, __ATOMIC_SEQ_CST)) {  /* R11: atomic to avoid TOCTOU with SIGUSR1 */
             fprintf(stderr,
                     "=== XDP Echo Stats ===\n"
                     "rx: %lu pkts  %lu bytes\n"
