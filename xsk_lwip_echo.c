@@ -65,6 +65,7 @@
 #define EMERGENCY_POISON_POOL_SIZE 256
 #define FREE_POOL_INVALID_ADDR 0xFFFFFFFFFFFFFFFFULL
 #define MAX_ORPHAN_WRAPPERS      1024   /* threshold to trigger reset */
+#define MAX_CONNECTIONS          256    /* HI-6: per-server hard connection cap */
 
 #define align_up(x, a) (((x) + (a) - 1) & ~((a) - 1))  /* R1-1: align x up to multiple of a */
 
@@ -77,10 +78,13 @@
 
 /* R7-1: signal-safe graceful shutdown flag */
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_print_stats = 0;              /* MD-7: SIGUSR1 triggers stats dump */
 
 static void signal_handler(int sig) {
-    (void)sig;
-    g_running = 0;
+    if (sig == SIGUSR1)
+        g_print_stats = 1;
+    else
+        g_running = 0;
 }
 
 /* ---------- inline bitmap operations ---------- */
@@ -217,6 +221,7 @@ struct xskif {
     struct poison_frame emergency_poison_pool[EMERGENCY_POISON_POOL_SIZE];
     struct poison_frame *emergency_pool_free_head;
     struct echo_ctx *ctx_list_head;
+    uint32_t    active_connections;                             /* HI-6: current connection count */
     struct timespec last_reset_ts;                           /* R8-1: reset rate-limit */
 };
 
@@ -542,11 +547,14 @@ static void clear_orphaned_wrappers(struct xskif *xif) {
 /* XDP / XSK setup                                                           */
 /*============================================================================*/
 u32_t sys_now(void) {
+    static u32_t last_ms = 0;
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
-        return (u32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        u32_t ms = (u32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        last_ms = ms;
+        return ms;
     }
-    return 0;
+    return ++last_ms;   /* MD-6: monotonic fallback when clock_gettime fails */
 }
 
 static int generate_random_mac(unsigned char *mac) {
@@ -565,7 +573,7 @@ static int generate_random_mac(unsigned char *mac) {
     return 0;
 }
 
-int xskif_setup(struct xskif *xif, int core_id, int numa_node,
+static int xskif_setup(struct xskif *xif, int core_id, int numa_node,
                 uint32_t total_frames, int num_cores, const char *ifname) {
     int ret;
 
@@ -1281,6 +1289,11 @@ static err_t echo_accept(void *arg, struct tcp_pcb *new_pcb, err_t err) {
         return ERR_ABRT;
     }
 
+    if (xif->active_connections >= MAX_CONNECTIONS) {        /* HI-6: hard cap */
+        tcp_abort(new_pcb);
+        return ERR_ABRT;
+    }
+
     struct echo_ctx *ctx = calloc(1, sizeof(struct echo_ctx));
     if (!ctx) {
         xif->stats.echo_malloc_fails++;
@@ -1305,6 +1318,7 @@ static err_t echo_accept(void *arg, struct tcp_pcb *new_pcb, err_t err) {
     if (xif->ctx_list_head)
         xif->ctx_list_head->prev = ctx;
     xif->ctx_list_head = ctx;
+    xif->active_connections++;                               /* HI-6: track active connections */
     return ERR_OK;
 }
 
@@ -1319,6 +1333,9 @@ static void echo_connection_cleanup(struct echo_ctx *ctx) {
         xif->ctx_list_head = ctx->next;
     if (ctx->next)
         ctx->next->prev = ctx->prev;
+
+    if (xif->active_connections > 0)
+        xif->active_connections--;                           /* HI-6: track active connections */
 
     if (ctx->pcb) {
         tcp_arg(ctx->pcb, NULL);
@@ -1698,9 +1715,17 @@ static void xskif_destroy(struct xskif *xif) {
 /*============================================================================*/
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <ifname>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <ifname> [core_id] [numa_node] [num_cores] [total_frames]\n", argv[0]);
         return 1;
     }
+    char *ifname = argv[1];
+    int   core_id      = (argc > 2) ? atoi(argv[2]) : 0;
+    int   numa_node    = (argc > 3) ? atoi(argv[3]) : 0;
+    int   num_cores    = (argc > 4) ? atoi(argv[4]) : 1;
+    int   total_frames = (argc > 5) ? atoi(argv[5]) : 16384;
+
+    if (num_cores <= 0) { num_cores = 1; }
+    if (total_frames < num_cores) { total_frames = num_cores; }
 
     lwip_init();
 
@@ -1711,7 +1736,7 @@ int main(int argc, char **argv) {
     xif.netif = &netif;
     xif.ctx_list_head = NULL;
 
-    int ret = xskif_setup(&xif, 0, 0, 16384, 1, argv[1]);
+    int ret = xskif_setup(&xif, core_id, numa_node, (uint32_t)total_frames, num_cores, ifname);
     if (ret != 0) {
         fprintf(stderr, "xskif_setup failed: %d\n", ret);
         return 1;
@@ -1738,7 +1763,7 @@ int main(int argc, char **argv) {
         xskif_destroy(&xif);
         return 1;
     }
-    tcp_bind(xif.listen_pcb, IP_ADDR_ANY, 12345);
+    tcp_bind(xif.listen_pcb, IP_ADDR_ANY, 7);
     struct tcp_pcb *listen_pcb = tcp_listen(xif.listen_pcb);
     if (!listen_pcb) {
         fprintf(stderr, "tcp_listen failed\n");
@@ -1756,9 +1781,36 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);                           /* MD-7: stats dump on SIGUSR1 */
     signal(SIGPIPE, SIG_IGN);    /* R10-5: prevent crash on broken pipe */
 
     while (g_running) {
+        if (g_print_stats) {                                 /* MD-7: signal-handler sets this flag */
+            g_print_stats = 0;
+            fprintf(stderr,
+                    "=== XDP Echo Stats ===\n"
+                    "rx: %lu pkts  %lu bytes\n"
+                    "tx: %lu pkts  %lu bytes\n"
+                    "resets:    %lu\n"
+                    "oom_closes: %lu    stalls: %lu\n"
+                    "fill_starv: %lu    ghost_completions: %lu\n"
+                    "obj_pool_exh: %lu  pool_overflow_resets: %lu\n"
+                    "rx_inflight_peak: %lu\n"
+                    "active_connections: %u\n",
+                    (unsigned long)xif.stats.rx_packets,
+                    (unsigned long)xif.stats.rx_bytes,
+                    (unsigned long)xif.stats.tx_packets,
+                    (unsigned long)xif.stats.tx_bytes,
+                    (unsigned long)xif.stats.total_resets,
+                    (unsigned long)xif.stats.flow_control_oom_closes,
+                    (unsigned long)xif.stats.flow_control_stalls,
+                    (unsigned long)xif.stats.fill_ring_starvation,
+                    (unsigned long)xif.stats.ghost_completions,
+                    (unsigned long)xif.stats.obj_pool_exhausted,
+                    (unsigned long)xif.stats.pool_overflow_resets,
+                    (unsigned long)xif.stats.rx_in_flight_peak,
+                    xif.active_connections);
+        }
         xsk_tx_completion_batch(&xif);
         xskif_input(xif.netif);   /* R1-3: pass netif*, not xskif* */
 
