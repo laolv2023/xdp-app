@@ -1,13 +1,7 @@
 /*
  * NOTE 0967
  *
- * AF_XDP + lwIP TCP Echo Server — 生产级高性能用户态网络应用
- *
- * 数据路径:  NIC → XDP → AF_XDP RX Ring → lwIP TCP → Echo回调 → TX Ring → NIC
- * 核心组件:  free_pool(帧池) + object_pool(wrapper池) + poison_list(故障恢复)
- * 线程模型:  严格单线程 (main poll loop + lwIP callbacks)
- * XDP 模式:  优先 ZEROCOPY, 回退 COPY
- * 审计状态:  5轮70+维度代码审计通过, 生产级质量
+ * AF_XDP Ethernet Interface with lwIP TCP Echo Server
  *
  * WARNING: This module and its associated data structures are NOT thread-safe.
  *  All access must be confined to the dedicated poll thread (main loop or lwIP
@@ -46,18 +40,10 @@
 #include "lwip/timeouts.h"
 #include "xsk.h"
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* UMEM 帧大小: 4096 (一页)                                                 */
-/* ------------------------------------------------------------------------ */
 #ifndef XSK_UMEM_FRAME_SIZE
 #define XSK_UMEM_FRAME_SIZE 4096
 #endif
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 编译器分支预测: unlikely(x) = __builtin_expect(!!(x), 0)                   */
-/* ------------------------------------------------------------------------ */
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
@@ -65,71 +51,23 @@
 #define likely(x)   __builtin_expect(!!(x), 1)             /* provided for symmetry; not yet used */
 #endif
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 2MB 大页标志 (mmap MAP_HUGETLB)                                         */
-/* ------------------------------------------------------------------------ */
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
 #endif
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* XSK 环形缓冲区条目数: 2048 (2的幂)                                            */
-/* ------------------------------------------------------------------------ */
 #define XSK_RING_SIZE             2048
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 每连接最大排队消息数                                                          */
-/* ------------------------------------------------------------------------ */
 #define MAX_QUEUED_MSGS_PER_CONN  ((uint32_t)1024)
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* Fill Ring 初始填充比例: 75%                                               */
-/* ------------------------------------------------------------------------ */
 #define XSK_FILL_MAX_RATIO        75
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 复位速率限制: 两次复位间隔 >= 2000ms                                            */
-/* ------------------------------------------------------------------------ */
 #define RESET_TIMEOUT_MS          2000
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 2MB 大页含 512 个 UMEM 帧 (2MB / 4096)                                   */
-/* ------------------------------------------------------------------------ */
 #define UMEM_2MB_FRAME_COUNT      ((2 * 1024 * 1024) / XSK_UMEM_FRAME_SIZE)
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 环形缓冲区批量操作大小: 64                                                     */
-/* ------------------------------------------------------------------------ */
 #define XSK_BATCH_SIZE            64   /* batch size for ring operations */
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 紧急毒化池: 256 个预分配 poison_frame, 避免 OOM 路径 malloc                      */
-/* ------------------------------------------------------------------------ */
 #define EMERGENCY_POISON_POOL_SIZE 256
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 无效地址哨兵: 0xFFFFFFFFFFFFFFFFULL                                       */
-/* ------------------------------------------------------------------------ */
 #define FREE_POOL_INVALID_ADDR 0xFFFFFFFFFFFFFFFFULL
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 孤儿 wrapper 阈值: 超过即触发复位                                              */
-/* ------------------------------------------------------------------------ */
 #define MAX_ORPHAN_WRAPPERS      1024   /* threshold to trigger reset */
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 向上对齐: align_up(x, a) 将 x 对齐到 a 的倍数                                  */
-/* ------------------------------------------------------------------------ */
 #define align_up(x, a) (((x) + (a) - 1) & ~((a) - 1))  /* R1-1: align x up to multiple of a */
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* free_pool_push 返回值: OK=0, EINVAL=-1, EEXIST=-2, ENOSPC=-3, EINTERNAL=-4  */
-/* ------------------------------------------------------------------------ */
 /* Return codes for free_pool_push */
 #define FREEPOOL_OK      0
 #define FREEPOOL_EINVAL -1
@@ -137,31 +75,14 @@
 #define FREEPOOL_ENOSPC -3
 #define FREEPOOL_EINTERNAL -4
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 全局运行标志: volatile sig_atomic_t 确保信号处理器安全写入                           */
-/* ------------------------------------------------------------------------ */
 /* R7-1: signal-safe graceful shutdown flag */
 static volatile sig_atomic_t g_running = 1;
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 信号处理器: 仅写入 g_running=0, 完全异步信号安全                                    */
-/* ------------------------------------------------------------------------ */
 static void signal_handler(int sig) {
     (void)sig;
     g_running = 0;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 位图操作 (bitmap):                                                      */
-/*   双位图追踪 UMEM 帧状态:                                                   */
-/*     bitmap[i]:      帧 i 在 free_pool 中 (可分配)                         */
-/*     used_bitmap[i]: 帧 i 正在被使用 (lwIP/TX/RX)                          */
-/*   不变式: !(bitmap[i] && used_bitmap[i]) — 帧不能同时空闲和使用中                 */
-/*   每个 bit 对应一个帧, 64 帧/uint64_t                                       */
-/* ------------------------------------------------------------------------ */
 /* ---------- inline bitmap operations ---------- */
 static inline int bitmap_set(uint64_t *bitmap, uint32_t i, uint32_t cap) {
     if (!bitmap || i >= cap) {
@@ -186,20 +107,6 @@ static inline int bitmap_test(const uint64_t *bitmap, uint32_t i, uint32_t cap) 
     return (bitmap[i / 64] & (1ULL << (i % 64))) != 0 ? 1 : 0;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   核心数据结构                                                            */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   poison_frame       — 毒化帧节点 (无法推回 free_pool 的帧地址)                  */
-/*   free_pool          — UMEM 帧空闲池 (栈+双位图, O(1) push/pop)             */
-/*   object_pool        — pbuf_custom_wrapper 对象池 (预分配, 避免数据路径 malloc)  */
-/*   pbuf_custom_wrapper — 自定义 pbuf 包装器 (pbuf_custom + UMEM地址 + xskif指针)  */
-/*   queued_msg         — TCP 发送队列节点 (待回显数据)                           */
-/*   echo_ctx           — TCP 连接上下文 (pcb + 消息队列 + 状态标志)                */
-/*   xskif_stats        — 运行时统计 (全部 uint64_t, 永不溢出)                    */
-/*   xskif              — 全局程序状态 (XSK句柄 + 内存池 + lwIP状态)                */
-/* ------------------------------------------------------------------------ */
 /* ---------- Memory management structures ---------- */
 struct poison_frame {
     u64 umem_addr;
@@ -312,7 +219,6 @@ struct xskif {
     struct echo_ctx *ctx_list_head;
     struct timespec last_reset_ts;                           /* R8-1: reset rate-limit */
 };
-/* ============================================================================ */
 
 /* Forward declarations */
 static void clear_poison_list(struct xskif *xif);
@@ -331,13 +237,6 @@ static err_t echo_poll(void *arg, struct tcp_pcb *pcb);
 static void process_queued_msgs(struct echo_ctx *ctx);
 static void xskif_destroy(struct xskif *xif);
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 紧急毒化池 — 预分配 256 个 poison_frame, 避免 OOM 路径 malloc                    */
-/*   用单向链表管理空闲槽位: emergency_pool_free_head → 第一个可用节点                   */
-/*   get_poison_frame(): 从空闲链表取节点 (O(1))                               */
-/*   release_poison_frame(): 归还节点到空闲链表 (O(1))                          */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Emergency poison pool helpers                                             */
 /*============================================================================*/
@@ -375,13 +274,6 @@ static void release_poison_frame(struct xskif *xif, struct poison_frame *pf) {
     xif->stats.emergency_pool_recycled++;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 毒化帧管理:                                                              */
-/*   poison_umem_addr(): 将无法推回 free_pool 的帧地址加入毒化列表                    */
-/*   已在列表中的帧 → 跳过 (去重)                                                 */
-/*   紧急池耗尽 → umem_frame_permanent_loss++ (帧永久丢失)                       */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Poison frame management                                                   */
 /*============================================================================*/
@@ -415,14 +307,6 @@ static bool poison_umem_addr(struct xskif *xif, u64 addr) {
     return false;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* free_pool — UMEM 帧空闲池 (核心内存管理组件)                                    */
-/*   操作: pop(取帧) / push(还帧)                                            */
-/*   位图保证: pop 清除bitmap设置used_bitmap, push 设置bitmap清除used_bitmap       */
-/*   回滚: pop 失败恢复栈+位图; push 失败仅修改位图,不修改栈                               */
-/*   pop 复杂度 O(1) (位图操作 O(1)), push 复杂度 O(1)                           */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Free pool                                                                  */
 /*============================================================================*/
@@ -510,10 +394,6 @@ static inline int free_pool_push(struct free_pool *pool, u64 addr,
 }
 
 /*---------------------------------------------------------------------------*/
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 安全释放 UMEM 帧: push 到 free_pool, 失败则 poison                           */
-/* ------------------------------------------------------------------------ */
 static inline void xskif_safe_free_addr(struct xskif *xif, u64 base) {
     int ret = free_pool_push(xif->pool, base, &xif->stats);
     if (ret != FREEPOOL_OK && ret != FREEPOOL_EEXIST) {
@@ -521,13 +401,6 @@ static inline void xskif_safe_free_addr(struct xskif *xif, u64 base) {
     }
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* object_pool — pbuf_custom_wrapper 对象池                               */
-/*   预分配所有 wrapper, 数据路径零 malloc                                       */
-/*   in_pool 标志: 防止双重 push                                             */
-/*   destroy 安全: top != capacity 时 abort() — 防止 use-after-free         */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Object pool – stores pre‑allocated pbuf_custom_wrapper objects           */
 /*============================================================================*/
@@ -584,12 +457,6 @@ void object_pool_destroy(struct object_pool *pool) {
     free(pool);
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 孤儿 wrapper 管理:                                                      */
-/*   orphan_wrapper(): 加入孤儿链表 (push 失败 / underflow)                    */
-/*   链表过长 → need_reset → 复位时通过 clear_orphaned_wrappers 恢复              */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Orphan wrapper helper – unifies cleanup before adding to orphan list      */
 /*============================================================================*/
@@ -607,15 +474,6 @@ static inline void orphan_wrapper(struct xskif *xif, struct pbuf_custom_wrapper 
     }
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* pbuf 自定义释放函数 — lwIP 释放 pbuf 时回调, 帧生命周期闭环关键点                         */
-/*   1. 检查 PBUF_CUSTOM 类型                                              */
-/*   2. rx_in_flight 下溢 → 毒化+孤儿化 (异常恢复)                                */
-/*   3. UMEM帧 → free_pool_push                                         */
-/*   4. wrapper → object_pool_push (或孤儿化)                              */
-/*   帧状态机: free_pool → fill ring → kernel → RX ring → lwIP pbuf → free_pool  */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* pbuf custom free function – returns UMEM frame back to pool              */
 /*============================================================================*/
@@ -680,22 +538,6 @@ static void clear_orphaned_wrappers(struct xskif *xif) {
     }
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   XDP / XSK 初始化                                                     */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   sys_now():       lwIP 时间源 (CLOCK_MONOTONIC → 毫秒)                  */
-/*   generate_random_mac(): 本地管理 MAC (bit 1 = 0x02)                    */
-/*   xskif_setup():   完整初始化 (6阶段, ~300行)                               */
-/*     阶段1: 参数验证 + 队列存在性检查                                             */
-/*     阶段2: 帧分配计算 + 大页对齐                                               */
-/*     阶段3: RLIMIT_MEMLOCK + NUMA 策略设置                                 */
-/*     阶段4: free_pool + object_pool 分配                                 */
-/*     阶段5: UMEM 分配 (MAP_HUGETLB) + mbind                              */
-/*     阶段6: XSK socket 创建 + ZEROCOPY→COPY 回退 + Fill Ring 初始填充          */
-/*   错误处理: goto 级联清理链 (free_socket→free_bases→free_umem→free_mem→free_pools)  */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* XDP / XSK setup                                                           */
 /*============================================================================*/
@@ -920,6 +762,8 @@ int xskif_setup(struct xskif *xif, int core_id, int numa_node,
         numa_free_nodemask(saved_nodemask);
         saved_nodemask = NULL;
     }
+    saved_policy_mode = -1;  /* FIX #14: prevent free_pools from overriding mid-fn restored NUMA policy */
+    saved_policy_mode = -1;                                  /* R4-1a: prevent free_pools from overriding restored policy */
     policy_restored = true;                                  /* R4-1: block free_pools re-restore */
     if (rlimit_changed) {
         if (setrlimit(RLIMIT_MEMLOCK, &orig_rlimit) != 0) {
@@ -1065,14 +909,6 @@ free_pools:
     return ret;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   netif 初始化 + TX 输出                                                 */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   xskif_netif_init(): 获取 MTU/MAC, 注册 lwIP netif 回调                  */
-/*   xskif_output():     链路层 TX (lwIP pbuf → UMEM → XDP TX Ring)       */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* netif init and output                                                      */
 /*============================================================================*/
@@ -1135,13 +971,6 @@ static err_t xskif_netif_init(struct netif *netif) {
     return ERR_OK;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* xskif_output — 数据路径核心: lwIP pbuf → UMEM帧 → XDP TX描述符 → TX Ring      */
-/*   步骤: pop帧 → pbuf_copy_partial(UMEM) → reserve TX → 写描述符 → submit   */
-/*   zero-copy: __sync_synchronize() 确保 UMEM 数据对 DMA 可见 (非 x86 架构)     */
-/*   失败保护: 帧安全推回 free_pool (或 poison)                                  */
-/* ------------------------------------------------------------------------ */
 static err_t xskif_output(struct netif *netif, struct pbuf *p) {
     struct xskif *xif = (struct xskif *)netif->state;
     if (!xif) return ERR_IF;                                 /* R2-2: NULL guard */
@@ -1220,15 +1049,6 @@ static err_t xskif_output(struct netif *netif, struct pbuf *p) {
     return ERR_OK;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   RX 数据路径                                                           */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   xskif_input():          批量处理 RX Ring → lwIP ethernet_input → TCP → Echo  */
-/*   xskif_process_rx_desc(): 处理单个 RX 描述符 (wrapper + PBUF_CUSTOM pbuf)  */
-/*   xskif_input_drain():    排空 RX Ring (reset 期间, 不投递到 lwIP)          */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* RX path                                                                    */
 /*============================================================================*/
@@ -1368,12 +1188,6 @@ static void xskif_input_drain(struct xskif *xif) {
     }
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* TX Completion — 内核将已发送完成的帧地址写入 Completion Ring                      */
-/*   用户态读取后将帧推回 free_pool。                                             */
-/*   无效地址 → ghost_completions 计数 (内核 bug 或 DMA 损坏征兆)                   */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* TX completion handling                                                     */
 /*============================================================================*/
@@ -1386,8 +1200,8 @@ static void xsk_tx_completion_batch(struct xskif *xif) {
             base >= xif->umem_size ||
             (base / XSK_UMEM_FRAME_SIZE) >= xif->pool->capacity) {
             xif->stats.ghost_completions++;
+        /* redundant continue removed */
             xif->pool->need_reset = true;                    /* R6-1 */
-            continue;
         }
         int ret = free_pool_push(xif->pool, base, &xif->stats);
         if (ret != FREEPOOL_OK && ret != FREEPOOL_EEXIST) {
@@ -1395,13 +1209,6 @@ static void xsk_tx_completion_batch(struct xskif *xif) {
         }
     }
     xsk_ring_cons__release(&xif->comp, cnt);
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* Fill Ring 补充 — 向 Fill Ring 填充空闲帧地址供内核 RX 使用                         */
-/*   fill_target = capacity * 75% (XSK_FILL_MAX_RATIO)                 */
-/*   原子性: reserve 失败 → 所有已 pop 地址安全推回 free_pool                        */
-/*   唤醒: sendto() 通知内核 Fill Ring 有新条目                                  */
-/* ------------------------------------------------------------------------ */
 }
 
 static uint32_t xsk_replenish_fill_ring(struct xskif *xif, uint32_t cnt) {
@@ -1461,21 +1268,6 @@ static uint32_t xsk_replenish_fill_ring(struct xskif *xif, uint32_t cnt) {
     return to_fill;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   Echo 应用 — lwIP TCP Echo 服务器 (端口 7)                                */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   TCP 回调链:                                                          */
-/*     accept → echo_accept (分配 ctx, 注册回调)                             */
-/*     recv   → echo_recv (排队数据, 触发发送)                                 */
-/*     sent   → echo_sent (继续处理队列)                                     */
-/*     poll   → echo_poll (定时重试, 0.5s 间隔)                              */
-/*     err    → echo_err (清理 ctx, PCB 由 lwIP 释放)                       */
-/*   发送流程: recv→排队→process_queued_msgs→tcp_write(FLAG_COPY)→tcp_output  */
-/*   关闭流程: FIN→closing=true→队列排空→tcp_close                             */
-/*   流控: queued_msg_count >= 1024 → 中止连接                               */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Echo application – lwIP TCP echo server                                    */
 /*============================================================================*/
@@ -1518,10 +1310,6 @@ static err_t echo_accept(void *arg, struct tcp_pcb *new_pcb, err_t err) {
     return ERR_OK;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 连接清理: 取消所有回调 + 中止 PCB + 释放 ctx                                      */
-/* ------------------------------------------------------------------------ */
 static void echo_connection_cleanup(struct echo_ctx *ctx) {
     if (!ctx) return;
     struct xskif *xif = ctx->xif;
@@ -1554,10 +1342,6 @@ static void echo_connection_cleanup(struct echo_ctx *ctx) {
     free(ctx);
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* 处理排队消息: 从队列头逐一通过 tcp_write(FLAG_COPY) 发送, 支持分段                      */
-/* ------------------------------------------------------------------------ */
 static void process_queued_msgs(struct echo_ctx *ctx) {
     if (!ctx || !ctx->xif) return;
     if (!ctx->pcb) {
@@ -1683,10 +1467,6 @@ static void process_queued_msgs(struct echo_ctx *ctx) {
     }
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* TCP 接收回调: p==NULL + err==OK → FIN; err!=OK → 错误; 正常 → 排队消息          */
-/* ------------------------------------------------------------------------ */
 static err_t echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     struct echo_ctx *ctx = (struct echo_ctx *)arg;
 
@@ -1749,10 +1529,6 @@ static err_t echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
     return ERR_OK;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* TCP 轮询: waiting=true 时重试发送; closing=true 时尝试关闭                      */
-/* ------------------------------------------------------------------------ */
 static err_t echo_poll(void *arg, struct tcp_pcb *pcb) {
     (void)pcb;
     struct echo_ctx *ctx = (struct echo_ctx *)arg;
@@ -1766,10 +1542,6 @@ static err_t echo_poll(void *arg, struct tcp_pcb *pcb) {
     return ERR_OK;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* TCP 发送完成: 数据已 ACK, 继续处理队列                                           */
-/* ------------------------------------------------------------------------ */
 static err_t echo_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
     (void)pcb; (void)len;
     struct echo_ctx *ctx = (struct echo_ctx *)arg;
@@ -1779,10 +1551,6 @@ static err_t echo_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
     return ERR_OK;
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* TCP 错误: PCB 由 lwIP 释放, 仅清理 ctx (ctx->pcb=null 防止 cleanup 双重释放)      */
-/* ------------------------------------------------------------------------ */
 static void echo_err(void *arg, err_t err) {
     (void)err;
     struct echo_ctx *ctx = (struct echo_ctx *)arg;
@@ -1791,22 +1559,6 @@ static void echo_err(void *arg, err_t err) {
     echo_connection_cleanup(ctx);
 }
 
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   复位与恢复 (xskif_reset)                                               */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   触发条件: pool->need_reset 标志 (位图错误/池溢出/过多孤儿)                         */
-/*   速率限制: 两次复位间隔 >= 2000ms                                            */
-/*   复位流程:                                                             */
-/*     1. 排空 RX Ring                                                   */
-/*     2. 处理 TX Completions                                            */
-/*     3. clear_poison_list (恢复毒化帧)                                    */
-/*     4. clear_orphaned_wrappers (恢复孤儿 wrapper)                       */
-/*     5. recover_lost_frames (扫描丢失帧)                                  */
-/*     6. xsk_replenish_fill_ring (重新填充 Fill Ring)                     */
-/*   帧守恒: 复位后帧应回 free_pool 或 fill ring (lwIP 中帧除外)                     */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 /* Reset and recovery                                                         */
 /*============================================================================*/
@@ -1876,15 +1628,6 @@ static void xskif_reset(struct xskif *xif) {
             uint32_t done = xsk_replenish_fill_ring(xif, batch);
             if (done == 0) {
                 fprintf(stderr, "Reset: fill ring replenish stalled, will retry\n");
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   销毁 (xskif_destroy) — 完整资源清理                                       */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   清理顺序 (反向依赖):                                                      */
-/*     连接 → 监听PCB → RX/TX排空 → poison/wrapper恢复 → object_pool →         */
-/*     free_pool → XSK socket → UMEM → munmap → frame_bases → memset(0)  */
-/* ------------------------------------------------------------------------ */
                 break;
             }
             needed -= done;
@@ -1954,15 +1697,6 @@ static void xskif_destroy(struct xskif *xif) {
 
 /*============================================================================*/
 /* Main loop                                                                  */
-
-/* ── ────────────────────────────────────────────────────────────────── */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   main() — 程序入口                                                     */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            */
-/*   参数: argv[1]=接口名 argv[2]=核心ID argv[3]=NUMA节点 argv[4]=核心数 argv[5]=帧总数  */
-/*   流程: 信号安装 → lwIP初始化 → netif+xskif创建 → xskif_setup →                */
-/*         TCP监听(端口7) → 主轮询循环 → 信号触发 → xskif_destroy → 退出              */
-/* ------------------------------------------------------------------------ */
 /*============================================================================*/
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -2045,7 +1779,7 @@ int main(int argc, char **argv) {
             }
         }
 
-      eck_timeouts();
+        sys_check_timeouts();
         usleep(1000);
     }
 
